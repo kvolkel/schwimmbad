@@ -31,7 +31,6 @@ def _import_mpi(quiet=False, use_dill=False):
         if not quiet:
             # Re-raise with a more user-friendly error:
             raise ImportError("Please install mpi4py")
-
     return MPI
 
 
@@ -49,23 +48,27 @@ class MPIPool(BasePool):
     Parameters
     ----------
     comm : :class:`mpi4py.MPI.Comm`, optional
-        An MPI communicator to distribute tasks with. If ``None``, this uses
+        An MPI communicator that receives tasks from the comm master, this is the comm that allows task distribution. If ``None``, this uses
         ``MPI.COMM_WORLD`` by default.
+    task_comm : :class:`mpi4py.MPI.Comm`, optional
+        An MPI communicator that sends a given task to its helpers. If ``None``, it is assumed that no helpers are being used, e.g. 1 rank per 
+    task.
     use_dill: Set `True` to use `dill` serialization. Default is `False`.
     """
 
-    def __init__(self, comm=None, use_dill=False):
+    def __init__(self, comm=None, task_comm=None, use_dill=False):
         MPI = _import_mpi(use_dill=use_dill)
-
         if comm is None:
             comm = MPI.COMM_WORLD
         self.comm = comm
-
+        self.task_comm=task_comm
         self.master = 0
-        self.rank = self.comm.Get_rank()
-
+        #processes not a part of the main communicator will present it as COMM_NULL
+        if self.comm != MPI.COMM_NULL:
+            self.rank = self.comm.Get_rank()
+        else:
+            self.rank=-1 #set to non-zero to identify as worker still
         atexit.register(lambda: MPIPool.close(self))
-
         if not self.is_master():
             # workers branch here and wait for work
             try:
@@ -89,7 +92,6 @@ class MPIPool(BasePool):
             raise ValueError("Tried to create an MPI pool, but there "
                              "was only one MPI process available. "
                              "Need at least two.")
-
     @staticmethod
     def enabled():
         if MPI is None:
@@ -98,7 +100,13 @@ class MPIPool(BasePool):
             if MPI.COMM_WORLD.size > 1:
                 return True
         return False
+    
+    def is_task_master(self):
+        return self.task_comm!=None and self.task_comm.Get_rank()==0
 
+    def using_helper_tasks(self):
+        return self.task_comm!=None 
+    
     def wait(self, callback=None):
         """Tell the workers to wait and listen for the master process. This is
         called automatically when using :meth:`MPIPool.map` and doesn't need to
@@ -107,29 +115,42 @@ class MPIPool(BasePool):
         if self.is_master():
             return
 
-        worker = self.comm.rank
+        if self.is_task_master() or not self.using_helper_tasks():
+            worker = self.comm.rank
+        else:
+            worker = -1
+        
         status = MPI.Status()
         while True:
+            task=None
             log.log(_VERBOSE, "Worker {0} waiting for task".format(worker))
-
-            task = self.comm.recv(source=self.master, tag=MPI.ANY_TAG,
-                                  status=status)
-
+            #should receive tasks only if process is master or not using helper tasks
+            if self.is_task_master() or not self.using_helper_tasks(): 
+                task = self.comm.recv(source=self.master, tag=MPI.ANY_TAG,
+                                      status=status)
+            if self.using_helper_tasks(): #broadcast task to the helpers
+                task = self.task_comm.bcast(task,root=0)
             if task is None:
                 log.log(_VERBOSE, "Worker {0} told to quit work".format(worker))
                 break
-
             func, arg = task
             log.log(_VERBOSE, "Worker {0} got task {1} with tag {2}"
                     .format(worker, arg, status.tag))
 
-            result = func(arg)
-
+            if not self.using_helper_tasks():
+                result = func(arg)
+            else:
+                try:
+                    result = func(arg,task_comm = self.task_comm) 
+                except TypeError:
+                    raise TypeError("Missing communicator argument. Make sure that your task can accept a keyword argument <task_comm>.")
+            
             log.log(_VERBOSE, "Worker {0} sending answer {1} with tag {2}"
                     .format(worker, result, status.tag))
 
-            self.comm.ssend(result, self.master, status.tag)
-
+            if self.is_task_master() or not self.using_helper_tasks():
+                self.comm.send(result, self.master, status.tag)
+                
         if callback is not None:
             callback()
 
@@ -183,14 +204,12 @@ class MPIPool(BasePool):
                 log.log(_VERBOSE, "Sent task %s to worker %s with tag %s",
                         task[1], worker, taskid)
                 self.comm.send(task, dest=worker, tag=taskid)
-
             if tasklist:
                 flag = self.comm.Iprobe(source=MPI.ANY_SOURCE, tag=MPI.ANY_TAG)
                 if not flag:
                     continue
             else:
                 self.comm.Probe(source=MPI.ANY_SOURCE, tag=MPI.ANY_TAG)
-
             status = MPI.Status()
             result = self.comm.recv(source=MPI.ANY_SOURCE, tag=MPI.ANY_TAG,
                                     status=status)
@@ -198,13 +217,10 @@ class MPIPool(BasePool):
             taskid = status.tag
             log.log(_VERBOSE, "Master received from worker %s with tag %s",
                     worker, taskid)
-
             callback(result)
-
             workerset.add(worker)
             resultlist[taskid] = result
             pending -= 1
-
         return resultlist
 
     def close(self):
