@@ -41,6 +41,15 @@ Documentation
 The documentation for ``schwimmbad`` is hosted on `Read the docs
 <http://schwimmbad.readthedocs.io/>`_.
 
+
+DNA Storage Changes
+*******************
+
+* ``schwimmbad/mpi.py`` changed to support communicators to allow for MPI communicator groups on a given task. For DNA storage, provides power for pipeline pieces to utilize MPI parallelization. Immediately useful for strand-grain parallelization, could be useful for clustering algorithms.
+* ``schwimmbad/__init__.py`` changed to allow pool interface to return mpi pool object that is configured for task based parallelism.
+
+
+
 Attribution
 -----------
 
